@@ -1,0 +1,563 @@
+#!/usr/bin/perl
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
+# 02110-1301, USA.
+
+use File::Copy;
+use Getopt::Std;
+use File::Path;
+use FileHandle;
+use strict;
+
+# subroutine to copy while maintaining permissions
+sub copyWP {
+		my $from = $_[0];
+		my $to = $_[1];
+		if (-e $to) {
+				chmod(0600, $to) or die "Failed to prepare $to for overwriting: $!";
+		}
+		copy($from, $to) or die "Failed to copy: $!";
+
+		my $mode = (stat($from))[2] & 0777;
+		chmod($mode, $to) or die "Failed to chmod: $!";
+		
+}
+
+
+my @temp = split(' ', '$Revision: 4.7 $ ');
+my $version = $temp[1];
+
+my $homedir = $ENV{"HOME"} || $ENV{"LOGDIR"} || (getpwuid($<))[7];
+my $hostname = `hostname`; chomp($hostname);
+if(substr($homedir,-1,1) ne "/") {$homedir = $homedir . "/";}
+
+my ($rcs_quiet, $diffargs);
+my ($configfile, $historypath);
+
+if($< == 0) {
+		# if we're root
+
+		# check multiple locations for the config files; if none exist,
+		# use the last one, and we'll die later on. Useful for different
+		# operating systems.
+    ((-e ($configfile = '/etc/changetrack.conf')) or
+		 (-e ($configfile = '/usr/local/etc/changetrack.conf')));
+
+		((-e ($historypath = '/var/lib/changetrack')) or
+		 (-e ($historypath = '/var/db/changetrack')));
+}
+else {
+    $configfile =  $homedir . '.changetrackrc';
+    $historypath = $homedir . '.changetrack';
+}
+
+my $error = getopts('hc:d:a:m:erqM:vuo:f:');
+our($opt_h, $opt_c, $opt_d, $opt_a, $opt_m, $opt_e, $opt_r, $opt_q,
+    $opt_M, $opt_v, $opt_u, $opt_o, $opt_f);
+
+if($opt_h || !$error || @ARGV)
+{
+    if(@ARGV) {print "Unknown option: @ARGV\n";}
+    print <<EOF
+This is changetrack, version $version.
+  This program keeps track of changes made to files.
+
+  -h                          display this help and exit
+  -c configfile               Set name of configuration file
+  -d directory                Set output directory
+  -e                          Make ed files for each one
+  -r                          Do not use RCS
+  -q                          Quiet mode -- display only important messages
+  -m message                  Put a message in each file.
+                              Useful for indicating reboots, etc.
+                              Some special characters will break sh.
+  -M message                  Like -m, except message is only printed for 
+                              modified files.
+  -v                          print version and exit.
+  -u                          unified diffs. Tested with GNU diff
+  -o emailaddress             Mail output to emailaddress. This is
+                              supplemental to emails specified in the
+                              config file.
+  -f emailaddress             Set "From" header to emailaddress.
+                              Assumes emailaddress is valid.
+EOF
+    ;
+    exit 1;
+}
+
+if ($opt_q) {
+    $rcs_quiet = "-q";
+} else {
+    $rcs_quiet = "";
+}
+if($opt_v) {print "$version\n"; exit;}            # just the version
+if($opt_c) {$configfile = $opt_c;}                # file storing files to check
+if($opt_d) {$historypath = $opt_d;}               # directory to store output in
+if($opt_u) {$diffargs = "-u";}                    # unified diffs
+
+my $message = $opt_m;                             # message (for reboots, etc.)
+my $Message = $opt_M;                             # other message.
+if(substr($historypath,-1) ne "/") {$historypath .= "/";}
+                                                  # needs to be a folder; 
+                                                  # forgot the '/'?
+
+mkpath("$historypath", 0, 0711);                  # create it if it does not exist
+mkpath("$historypath/RCS", 0, 0711);              # create RCS directory if needed
+
+my $date = scalar localtime;                      # store the date in $date
+
+open(CONFIG, "$configfile") or die "Exiting: can't open $configfile:$!\n";
+
+if(!$opt_q) {print "Using $configfile, writing to $historypath\n";};
+my $emailaddresses = "";
+my @emails;
+my ($compfile, $filemode, $fileuid, $filegid);
+my ($logfile, $statfile, $origfile, $outfile, $edfile, $yestfile);
+my ($oldfilemode, $oldfileuid, $oldfilegid, $statschanged );
+my ($oldusername, $username, $oldgroupname, $groupname, $diff);
+my %emessages;
+
+while(<CONFIG>) {
+    # for each config line
+    chomp;
+    
+    if(m/\s*#/) { 
+       next; }                                    #ignore comments
+    if(m/^\s*$/) { 
+				next; }                                   # ignore blank lines
+    
+    # split by whitespace:whitespace
+    my ($filename,$email,$options)=split(/\s+:\s+/); 
+    # get the list of emails, separated by whitespace
+    @emails = split(/\s+/,$email);
+    
+    # add any address specified by -o on command line
+    if (defined($opt_o) && ($opt_o ne '')) {
+				push @emails, $opt_o;
+    }
+    
+    # list of emails for this file
+    foreach $email (@emails) {
+				if(index($emailaddresses,$email,0) == -1) {
+						# if the user is not yet in the list, add them
+						$emailaddresses .= " " . $email;
+				}
+    }
+		
+    my @files;
+		
+    my $firstchar = substr($filename,0,1);
+    
+    if( $firstchar eq "@" ) {
+        my $rest = substr($filename,1);
+				
+        # execute as find command
+        @files = split '\0', `find2perl $rest -print0 |perl`;
+    }
+    else
+    {
+				# make these relative to user's home directory
+				if(substr($filename,0,1) ne "/") {
+						$filename = $homedir . $filename;
+				}
+				
+				# find non-backup files matching the filename
+				@files = glob $filename;
+    }
+		
+    my $anyfile = 0;                              # flag in case we find nothing
+		
+    foreach my $realfile ( @files ) {
+				my @diff = ();
+				my @ed = ();
+				
+				if( "$realfile" =~ m/[\r\n\f\t<>`\$&!'"{}()\[\]\|]/ ) {
+						if(!$opt_q)
+						{ print "Skipping unsafe filename '$realfile'\n";}
+						@diff = (@diff, "unsafe: '$realfile'\n");
+						next;
+				}
+
+				# skip backup files not explicitly included	
+				if((substr("$realfile",-1,1) eq "~") && ($filename =~ m/\*/)) {
+						if(!$opt_q)
+						{ print "Skipping backup file $realfile\n";}
+						next;	
+				}
+				
+				# skip directories
+				if(-d "$realfile") {
+						if(!$opt_q)
+						{ print "Skipping directory $realfile\n";}	    
+						@diff = (@diff, "Is a directory: $realfile\n");
+						next;
+				}
+				
+				if( ! -f "$realfile" ) {
+						if(!$opt_q)
+						{ print "Skipping non-archivable $realfile\n";}	    
+						@diff = (@diff, "Is not a plain file: $realfile\n");
+						next;
+				}
+				
+				if( ! -e "$realfile" ) {
+						if(!$opt_q)
+						{ print "Skipping non-existing $realfile\n";}	    
+						@diff = (@diff, "Does not exist: $realfile\n");
+						next;	    
+				}
+				
+				if( ! -r "$realfile" ) {
+						if(!$opt_q)
+						{ print "Skipping unreadable $realfile\n";}
+						@diff = (@diff, "Is not readable: $realfile\n");
+						next;
+				}
+
+				$anyfile = 1;                       # at least one real file found
+				$compfile = $realfile;              # file for comparison
+				
+				@temp = stat $realfile;                  # other statistics:
+				$filemode= $temp[2] & 0777;              # access mode
+				$fileuid = $temp[4];                     # owner
+				$filegid = $temp[5];                     # group
+				
+				$compfile =~ s|/|:|g;                    # replace '/' with ':'
+				$compfile =~ s| |_|g;                    # replace ' ' with '_'
+				$compfile =~ s|^:||;                     # trash leading ':'
+				
+				$compfile = $historypath . $compfile;
+				$logfile = $compfile . ".history";       # stores past events
+				$statfile = $compfile . ".statistics";   # stores current file info
+				$origfile = $compfile . ".original";     # stores name of original file
+				if($opt_e) {
+						$outfile = $compfile . ".edout";     # output from ed script
+						$edfile = $compfile . ".ed";         # ed script
+				}
+				$yestfile = $compfile . ".yesterday";    # stores current data
+				
+				if( ! -r "$yestfile" ) { # can't open yesterday, doesn't exist.
+						@diff = (@diff, "New file '$realfile'\n");
+						if($opt_e) {
+								@ed = (@ed,"# cat this file into ed, eg 'cat $edfile | ed'\n");
+								@ed = (@ed,"# output goes into $outfile\n");
+								@ed = (@ed,"# edit this file to get rid of commands you don't want.\n");
+								@ed = (@ed,"\n!cp \"$origfile\" \"$outfile\"\n");
+								@ed = (@ed,"E $outfile\n");
+								
+								# keep a copy of original file
+								copyWP($realfile, $origfile);
+						}
+						# so no changes noted today.
+						copyWP($realfile, $yestfile);
+						
+						open (STAT, ">$statfile") or die "Exiting: can't open > $statfile:$!\n";
+						printf STAT "%o\n%s\n%s\n", $filemode, $fileuid, $filegid;
+						close(STAT);
+						if(!$opt_r) {
+								copy($realfile, $compfile);
+								chdir($historypath);
+								`co $rcs_quiet "$compfile"`; # hack to make rcs work.
+								system("rcs $rcs_quiet -i -t-'this is \"$realfile\"' \"$compfile\"");
+								`rcs $rcs_quiet -U "$compfile"`;
+								`rm -f "$compfile"`;
+						}
+				}
+				
+				open(STAT, "$statfile") or die "Exiting: can't open < $statfile:$!\n";
+				$oldfilemode = <STAT>;                    # get the old permissions
+				chomp($oldfilemode);
+				$oldfilemode = oct $oldfilemode;
+				
+				$oldfileuid = <STAT>;                     # get the old owner
+				chomp($oldfileuid);
+				
+				$oldfilegid = <STAT>;                     # get the old group
+				chomp($oldfilegid);
+				
+				close(STAT);
+				
+				$statschanged = 0;                        # 'nothing changed' flag
+				
+				if($oldfilemode != $filemode) {
+						@diff = (@diff, (sprintf "File permissions changed: was %o now %o\n", $oldfilemode, $filemode));
+						@ed = (@ed, ( sprintf "!chmod %o %s\n", $filemode, $outfile));
+						$statschanged = 1;
+				}
+				
+				if($oldfileuid != $fileuid) {
+						$oldusername = getpwuid($oldfileuid);
+						$username = getpwuid($fileuid);
+						@diff = (@diff, "Owner changed: was $oldusername ($oldfileuid) now $username ($fileuid)\n");
+						@ed = (@ed,"!chown $fileuid $outfile\n");
+						$statschanged = 1;
+				}
+				
+				if($oldfilegid != $filegid) {
+						$oldgroupname = getgrgid($oldfilegid);
+						$groupname = getgrgid($filegid);
+						@diff = (@diff, "Group changed: was $oldgroupname ($oldfilegid) now $groupname ($filegid)\n");
+						@ed = (@ed,"!chgrp $filegid $outfile\n");
+						$statschanged = 1;
+				}
+				
+				if($statschanged) {
+						open(STAT, ">$statfile") or die "Exiting: can't open to rewrite $statfile:$!\n";
+						printf STAT "%o\n%s\n%s\n", $filemode, $fileuid, $filegid;
+						close(STAT);
+				}
+				
+				open(DIFF, "diff $diffargs \"$yestfile\" \"$realfile\" |") or die "Exiting: can't run diff:$!\n";
+				
+				if(!$opt_q) {
+						print "$realfile";};
+				
+				while(<DIFF>) {
+						
+						# line starts with < or > or not unified header
+						if(m/^\</ || m/^\>/ || ($opt_u && !(m/^\-\-\-/||m/^\+\+\+/))) {
+								if(!$opt_q) {
+										print ".";};                  # indicate progress
+								
+								@diff = (@diff, $_);              # get that line
+						}
+						$diff = 1;                            # flag the changes
+				}
+				close(DIFF);
+	
+				if($diff) {
+						open(DIFF, "diff -e \"$yestfile\" \"$realfile\" |") or die "Can't do diff -e:$!\n";
+						# use -e to create ed commands
+						while(<DIFF>) {
+								@ed = (@ed,"$_");                 # get the 'ed'-styled diffs. No need to understand them.
+						}
+						close(DIFF);
+				}
+				
+				if(!$opt_q) {print "\n";};
+				
+				if(@diff || $message) {                   # there is something to add to the output file
+						# deal with emailing
+						foreach $email (@emails)
+						{
+								# it's ok to append to things that don't exist.
+								$emessages{$email} .= "Changes made to '$realfile' follow:\n";
+								foreach my $line (@diff) {
+										$emessages{$email} .= "  $line";
+								}
+								if($message) {
+										$emessages{$email} .= $message;}
+								# don't forget the message
+								$emessages{$email} .= "\n";       # separate from next file
+						}
+						
+						open(LOG,">>$logfile") or die "Exiting: can't open $logfile:$!\n";
+						print LOG "Changes made on $date follow:\n";
+						foreach my $line (@diff)                     
+						{
+								print LOG "  $line";              # save the line
+						}
+						if($message) {
+								print LOG "  $message\n";         # save any message (nb after all changes)
+						}
+						if(@diff && $Message) {
+								print LOG $Message;               # only if there are changes
+						}
+						print LOG "\n";                       # and a blank line
+						
+						# save the file for next time
+						copyWP($realfile, $yestfile);           
+						
+						# preserve file mode for the RCS log file and yesterdayfile.
+						chmod($filemode, $yestfile);
+						
+						my $chmodfile = $realfile;
+						$chmodfile =~ s|/|:|g;
+						$chmodfile =~ s| |_|g;
+						$chmodfile =~ s|^:||g;
+						# the RCS file should never be writable.
+						chmod($filemode & 0444, "$historypath/RCS/$chmodfile,v");
+
+						chmod($filemode & 0444 | 0600, "$historypath/$chmodfile.history");
+						chmod($filemode & 0444 | 0600, "$historypath/$chmodfile.statistics");
+
+						close(LOG);
+						
+						if($opt_e)
+						{
+								open(ED,">>$edfile") or die "Exiting: can't open $edfile:$!\n";
+								chmod($filemode & 0444 | 0600, "$edfile");
+								foreach my $line (@ed) {
+										print ED $line;               # save the edits as well
+								}	
+								print ED "w\n";                   # make sure ed writes the changes when run.
+								close(ED);
+						}
+						
+						if(!$opt_r) {
+								chdir($historypath) or die "Can't chdir to $historypath for ci: $!\n";
+								my $quiet = "";
+								print "cp \"$realfile\" \"$compfile\"\n" unless defined($opt_q);
+								`co \"$compfile\"`; # hack to make rcs work here too!
+								copyWP($realfile, $compfile);         # make backup copy
+								#`mv $realfile $realfile.track`;  # copy backwards, to keep modification date
+								#`cp $realfile.track $realfile`;  # make backup copy
+								system("ci $rcs_quiet -m'modification of \"$realfile\" on $date' -l \"$compfile\"");
+								`rm $compfile`;
+						}
+				}
+    }
+    
+    if(!$anyfile) {
+				# no file was matched by 'ls', so create message for misspelled files
+				$origfile = $filename;
+				$filename =~ s|/|:|g;        # replace each '/' by ':'
+				$filename =~ s| |_|g;        # replace each ' ' by '_'
+				$filename =~ s|^:||;         # remove leading ':'
+				open(LOG, ">>$historypath$filename");
+				print LOG "$date No files match `$origfile'\n";
+				close(LOG);
+    }
+}
+
+# The $mailfrom variable must be a valid email address (or at least be
+# from a valid domain).  Otherwise, outbound mail may get rejected by
+# an intermediate MTA before it is delivered to your mailbox (the old
+# 'changetrack@localhost' address is blocked by some anti-spam
+# filters).
+
+my $mailfrom = 'changetrack@' . "$hostname";
+
+# override by "from" address specified by -f on command line
+if (defined($opt_f) && ($opt_f ne ''))
+{
+    $mailfrom = $opt_f;
+}
+
+if($emailaddresses) {
+		
+    @emails = split(/\s+/,$emailaddresses);
+    my ($sendmail) = grep { -x } ('/usr/sbin/sendmail', '/usr/lib/sendmail');
+    $sendmail or die "no sendmail?\n";
+		
+    foreach my $email (@emails) {
+				if(($email) && ($message = $emessages{$email})) {
+						my $pipe = FileHandle->new ("|$sendmail -f $mailfrom -oi -odi $email");
+						$pipe or die "$!";
+						local ($, , $\ ) = ('', '');
+						$pipe->printf ("From: %s\nTo: %s\nSubject: %s\n\n%s", $mailfrom, $email,
+													 "Changed files on $hostname: $date", $message);
+						$pipe->close or warn "$?";
+				}
+    }
+}
+
+# $Log: changetrack,v $
+# Revision 4.7  2009/09/22 04:04:44  cmorland
+# Security fix from Debian.
+#
+# Revision 4.6  2009/07/21 17:10:19  cmorland
+# Copy even if we don't have write permission on the file.
+# Maintain current permissions!
+#
+# Revision 4.5  2006/06/22 18:45:32  cjmorlan
+# Allowed searching of multiple locations for root's config files, to
+# make it work nicely on FreeBSD, as demonstrated by Tiago de Lima
+# Bueno.
+#
+# Revision 4.4  2006/06/22 18:32:41  cjmorlan
+# Applied patch from Ian Zimmerman (via JPS) to use /usr/sbin/sendmail,
+# to adhere to Linux Standard Base.
+#
+# Revision 4.3  2005/02/28 16:50:23  cjmorlan
+# Removed debugging lines!
+#
+# Revision 4.2  2005/02/28 16:37:57  cjmorlan
+# Added find2perl patch from Sam Mikes, and documented it.
+#
+# Revision 4.1  2005/02/28 16:05:03  cjmorlan
+# Updated to revision 4. Also updated documentation.
+#
+# Revision 3.19  2005/02/28 15:22:19  cjmorlan
+# fixing it to match my old rcs system number.
+#
+# Revision 1.1.1.1  2004/11/09 14:12:24  cjmorlan
+# Initial checkin to CVS.
+#
+# Revision 3.18  2003/07/28 12:28:21  cjmorlan
+# Added patch from JPS to retain file permissions of *.ed files.
+#
+# Revision 3.17  2003/07/15 14:38:12  cjmorlan
+# Applied patch from Jens Peter Secher to use glob and oct instead of `ls`.
+#
+# Revision 3.16  2002/07/05 20:09:34  cjmorlan
+# added a second copy of the `co` hack to make rcs work.
+#
+# Revision 3.15  2002/07/04 14:11:38  cjmorlan
+# Added $HOSTNAME to subject line.
+# Made it work with "use strict;"
+# Regex cleanups.
+# Minor changes.
+#
+# Revision 3.14  2002/04/30 17:52:13  cjmorlan
+# Added -f option to specify the "From: " field in outgoing emails.
+#
+# Revision 3.13  2002/04/23 14:56:35  cjmorlan
+# Added | 0600 for history and statistics file, so they can always be
+# written by the owner.
+#
+# Revision 3.12  2002/04/18 18:43:40  cjmorlan
+# File permissions are now copied from the real file to the history, statistics,
+# yesterday, and RCS files. For the RCS files, no more than 0444 is granted.
+#
+# Revision 3.11  2002/04/18 17:59:19  cjmorlan
+# Fixed RCS file locking problem.
+#
+# Revision 3.10  2002/02/22 15:31:17  cjmorlan
+# Added patch from Jens Peter Secher
+#
+# Revision 3.9  2002/02/06 00:11:41  cjmorlan
+# Fixed serious flaws in 3.8 that prevented it from actually running.
+#
+# Revision 3.8  2002/02/05 23:46:17  cjmorlan
+# Make the installer smarter, so it detects File::NCopy and Mail::Sendmail
+#
+# Revision 3.7  2001/11/16 02:08:16  cjmorlan
+# Applied patch from Devin Reade
+#
+# Revision 3.6  2001/09/25 18:52:26  cjmorlan
+# Applied patch from Devin Reade to fix -o option.
+#
+# Revision 3.5  2001/03/06 18:47:33  cjmorlan
+# Intented according to emacs default.
+# Fixed some @foo[]
+#
+# Revision 3.4  2001/03/06 18:09:55  cjmorlan
+# Made version match RCS revision.
+#
+# Revision 3.3  2001/03/06 18:08:37  cjmorlan
+# Added change from Ian Zimmerman, fixing RCS integration bug.
+#
+# Revision 3.2  1999/10/21 20:32:13  cjmorlan
+# added email features, cleaned.
+# Release version 2
+#
+# Revision 3.1  1999/10/20 18:04:54  cjmorlan
+# replaced quotewords with split
+#
+# Revision 3.0  1999/09/24 04:45:03  cmorland
+# To add ideas from FSF
+#
+

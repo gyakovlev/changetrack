@@ -1,0 +1,157 @@
+.TH CHANGETRACK 1 "" "" \" -*- nroff -*-
+.SH NAME
+changetrack \- track changes to configuration files
+.SH SYNOPSIS
+.B changetrack
+[-h] [\-c configfile] [\-d directory] [-e] [-r] [-q] [\-m message] [\-M message] [-v] [-u] [\-o emailaddress]
+.SH DESCRIPTION
+.B changetrack
+is a program to monitor changes to a bunch of files. If files are  
+modify one day, and the machine starts working incorrectly some days later,
+.B changetrack
+can provide information on which files were modified, and help locate
+the problem. 
+.PP
+Normally
+.B changetrack
+uses
+.B rcs
+to keep track of various revisions of the files. Each file is "installed"
+in the 
+.B rcs
+system the first time that
+.B changetrack
+is run after that file is added to the config file. Whenever 
+.B changetrack
+is run after that, a copy of the file is made, which is 'checked in'
+and implicitly 'checked out' of the 
+.B rcs
+system. See the man page of 
+.B co
+for information on retrieving an old version of the file.
+.PP
+Backup files (ending in tilde ~) are ignored, unless explicitely included.
+.PP
+After each pattern in the file list, adding white space, a colon (:) then
+more whitespace, followed by email addresses, separated by more whitespace,
+will result in the changes to that file being emailed to that address. All
+changes from each run are expressed in one email. Using the email feature
+requires Mail::SendMail to be installed; if it does not work correctly, an
+error message will be printed to standard error.
+.SH OPTIONS
+.TP
+.B \-h
+Display a short help message then exit.
+.TP
+.BI \-c "configfile"
+Get the list of files to track from
+.I configfile
+instead of from ~/.changetrackrc
+(/etc/changetrack.conf for the super-user)
+.TP
+.BI \-d "outputdirectory"
+Store output in
+.I outputdirectory
+instead of in ~/.changetrack/
+(/var/lib/changetrack/ for the super-user)
+.TP
+.BI \-e
+Keep a copy of the file from when it was first added to the
+.B changetrack
+configuration, and keep
+.B ed
+-styled changes to rebuild the file.
+.I This option is recommended only if
+.BI rcs
+.I does not work on the machine.
+To recover using this means, the .ed file
+should have the last several commands removed, to allow the file to be rebuilt
+to the appropriate state. A command like 'cat myfile.ed | ed myfile.original'
+should be executed.
+.TP
+.B \-r
+Disable the 
+.B rcs
+facility.
+.TP
+.B \-q
+Quiet mode; only print critical messages. Good for scripts.
+.TP
+.BI \-m "message"
+Print
+.I message
+on each file, after checking for any changes. Good for indicating reboots 
+or other system events.
+.TP
+.BI \-M "message"
+Like \-m, but message is only printed on modified files.
+.TP
+.BI \-v
+Print version and exit.
+.TP
+.B \-u
+Use unified diffs (this only works with some implementations of
+.BI diff.
+.TP
+.BI \-o "emailaddress"
+Mail output to emailaddress. This is supplementary to emails specified in the config file.
++ .TP
++ .BI \-f "emailaddress"
++ Set "From" header to emailaddress (which must be a valid).
+
+.SH REQUIREMENTS
+This program requires
+.B diff.
+Unless the
+.B -r
+switch is used, this program requires
+.B rcs
+to be installed. If the 
+.B -e
+switch is used,
+.B ed
+is required.
+.SH FILES
+.TP
+~/.changetrackrc
+List of files to monitor. Each line may start with '#' indicating a comment.
+If a line is not a comment, it contains a file/pattern to monitor, and optionally
+" : " followed by any email addresses to send changes to. The filename may
+be a pattern described in the same way as for
+.B ls.
+Note: the default is 
+.B /etc/changetrack.conf
+for root.
+.TP
+~/.changetrack/
+Default directory in which to store output information. The default is
+.B /var/lib/changetrack/
+for root. All
+.B rcs
+files are stored in this directory, unless a subdirectory called RCS 
+exists, in which case the
+.B rcs
+files are stored in that directory.
+.SH DIAGNOSTICS
+Each filename is written to standard output.
+.B rcs
+will print errors if certain things go wrong. It will also print
+a few lines each time
+.B changetrack
+is run after a new file is added to the configuration.
+.SH IDENTIFICATION
+Author: Cameron J. Morland.
+.br
+Manual Page Revision: 2.1 Release Date: 2001-03-06.
+.br
+Copyright \(co 2001-2005 Cameron J. Morland.
+.SH "SEE ALSO"
+rcsintro(1), co(1)
+
+.SH TODO
+Automate removal of out-of-date changes, to save disk space and clarify
+the important changes.
+
+.SH BUGS
+None known.
+
